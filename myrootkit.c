@@ -194,3 +194,4 @@ static void filter_exit(void)
 module_init(filter_init);
 module_exit(filter_exit);
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Asensio");
