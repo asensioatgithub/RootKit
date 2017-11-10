@@ -1,6 +1,4 @@
-/*
-  进程隐藏程序
-*/
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <asm/unistd.h>
